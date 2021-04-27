@@ -1,0 +1,110 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+
+%% Copyright (c) 2021 Ji Zhu
+%% 
+%% Permission is hereby granted, free of charge, to any person obtaining a copy
+%% of this software and associated documentation files (the "Software"), to deal
+%% in the Software without restriction, including without limitation the rights
+%% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+%% copies of the Software, and to permit persons to whom the Software is
+%% furnished to do so, subject to the following conditions:
+%% 
+%% The above copyright notice and this permission notice shall be included in all
+%% copies or substantial portions of the Software.
+%% 
+%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+%% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+%% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+%% SOFTWARE.
+
+
+-mode(compile).
+
+-record(exec_args, {
+	server_sock_path = "/tmp/server.sock" :: string()
+	}).
+
+
+print_error(Format, Args) ->
+	io:format(standard_error, "ERROR: " ++ Format, Args).
+
+print_info(Format, Args) ->
+	io:format("INFO: " ++ Format, Args).
+
+parse_arguments([], ExecArgs) ->
+	ExecArgs.
+
+strip(Text) ->
+	HeadStrippedText = strip_head(Text),
+	strip_tail(HeadStrippedText).
+
+strip_tail(Text) ->
+	ReversedStrippedText = strip_head(lists:reverse(Text)),
+	lists:reverse(ReversedStrippedText).
+
+strip_head([$\n | RestText]) ->
+	strip_head(RestText);
+
+strip_head([$\t | RestText]) ->
+	strip_head(RestText);
+
+strip_head([$\s | RestText]) ->
+	strip_head(RestText);
+
+strip_head(Text) ->
+	Text.
+
+send_message(ConnSock, Text) ->
+	case gen_tcp:send(ConnSock, Text) of
+		ok ->
+			ok;
+		{error, _Reason} ->
+			print_error("Cannot send out message due to connection error~n", [])
+	end.
+
+process_user_input(ConnSock) ->
+	case io:get_line("") of
+		RawCmdLine when is_list(RawCmdLine) ->
+			CmdLine = strip(RawCmdLine),
+			case CmdLine of
+				"exit" ->
+					print_info("User requested to terminate program execution~n", []);
+				[$s, $e, $n, $d, $\s | Text] ->
+					print_info("Sending message: ~s~n", [Text]),
+					send_message(ConnSock, Text),
+					process_user_input(ConnSock);
+				"" ->
+					process_user_input(ConnSock);
+				_Else ->
+					print_error("Unrecoganized command~n", []),
+					process_user_input(ConnSock)
+			end;
+		eof ->
+			process_user_input(ConnSock);
+		{error, _Err} ->
+			print_error("I/O Reading error~n", []),
+			process_user_input(ConnSock)
+	end.
+
+run(ExecArgs) ->
+	case gen_tcp:connect({local, ExecArgs#exec_args.server_sock_path}, 0, [list, {active, false}]) of
+		{ok, ConnSock} ->
+			process_user_input(ConnSock),
+			gen_tcp:close(ConnSock);
+		{error, _Reason} ->
+			print_error("cannot open socket file: ~s~n", [ExecArgs#exec_args.server_sock_path]),
+			erlang:halt(1)
+	end.
+
+main(Args) ->
+	case catch parse_arguments(Args, #exec_args{}) of
+		#exec_args{} = ExecArgs ->
+			run(ExecArgs);
+		_Else ->
+			print_error("bad arguments.~n", []),
+			erlang:halt(1)
+	end.

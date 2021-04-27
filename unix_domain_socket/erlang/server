@@ -1,0 +1,211 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+
+%% Copyright (c) 2021 Ji Zhu
+%% 
+%% Permission is hereby granted, free of charge, to any person obtaining a copy
+%% of this software and associated documentation files (the "Software"), to deal
+%% in the Software without restriction, including without limitation the rights
+%% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+%% copies of the Software, and to permit persons to whom the Software is
+%% furnished to do so, subject to the following conditions:
+%% 
+%% The above copyright notice and this permission notice shall be included in all
+%% copies or substantial portions of the Software.
+%% 
+%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+%% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+%% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+%% SOFTWARE.
+
+
+-mode(compile).
+
+-record(exec_args, {
+	listen_sock_path = "/tmp/server.sock" :: string()
+	}).
+
+-record(conn_mgr_state, {
+	parent_pid :: pid(),
+	listen_socket :: gen_tcp:socket(),
+	listen_pid :: pid(),
+	handler_pids :: sets:set(pid())
+	}).
+
+
+print_error(Format, Args) ->
+	io:format(standard_error, "ERROR: " ++ Format, Args).
+
+print_info(Format, Args) ->
+	io:format("INFO: " ++ Format, Args).
+
+parse_arguments([], ExecArgs) ->
+	ExecArgs.
+
+connection_handler_init(ConnMgrPid, ConnSock) ->
+	print_info("Connection Handler (~w) is starting to work~n", [self()]),
+	inet:setopts(ConnSock, [{active, true}]),
+	connection_handler_loop(ConnMgrPid, ConnSock).
+
+connection_handler_loop(ConnMgrPid, ConnSock) ->
+	receive
+		{tcp, ConnSock, Data} ->
+			print_info("Connection Handler (~w) received the data: ~s~n", [self(), Data]),
+			connection_handler_loop(ConnMgrPid, ConnSock);
+		{tcp_closed, ConnSock} ->
+			gen_tcp:close(ConnSock),
+			ConnMgrPid ! {handler, self(), terminated},
+			print_info("Connection Handler (~w) stopped working due to connection closed~n", [self()]);
+		{tcp_error, ConnSock, _Reason} ->
+			ConnMgrPid ! {handler, self(), conn_error},
+			print_error("Connection Handler (~w) stopped working due to connection error~n", [self()]);
+		{parent, ConnMgrPid, terminate} ->
+			gen_tcp:close(ConnSock),
+			print_info("Connection Handler (~w) is terminated~n", [self()]);
+		Else ->
+			print_info("Connection Handler (~w) received unknown message: ~w, discarded~n", [self(), Else])
+	end.
+
+accept(ConnMgrPid, LSock) ->
+	print_info("Acceptor (~w) is starting to wait for connection establish...~n", [self()]),
+	case gen_tcp:accept(LSock) of
+		{ok, ConnSock} ->
+			print_info("Acceptor (~w) accepted the connection establishment~n", [self()]),
+			ConnMgrPid ! {acceptor, self(), accepted},
+			connection_handler_init(ConnMgrPid, ConnSock);
+		{error, _Reason} ->
+			ConnMgrPid ! {acceptor, self(), error}
+	end.
+
+connection_manage_init(PPid, LSock) ->
+	print_info("Connection Manager process (~w) is starting to work~n", [self()]),
+	MyPid = self(),
+	LPid = erlang:spawn(fun() -> accept(MyPid, LSock) end),
+	InitState = #conn_mgr_state{
+		parent_pid = PPid,
+		listen_socket = LSock,
+		listen_pid = LPid,
+		handler_pids = sets:new()
+		},
+	connection_manage_loop(InitState).
+
+connection_manage_loop(State) ->
+	#conn_mgr_state{
+		parent_pid = PPid,
+		listen_socket = LSock,
+		listen_pid = LPid,
+		handler_pids = HandlerPids
+	} = State,
+	receive
+		{acceptor, LPid, accepted} ->
+			MyPid = self(),
+			NewLPid = erlang:spawn(fun() -> accept(MyPid, LSock) end),
+			NewHandlerPids = sets:add_element(LPid, HandlerPids),
+			NewState = State#conn_mgr_state{
+				listen_pid = NewLPid,
+				handler_pids = NewHandlerPids
+				},
+			connection_manage_loop(NewState);
+		{acceptor, LPid, error} ->
+			print_error("Connection Mananger process (~w) exit due to socket error~n", [self()]),
+			erlang:exit(socket_error);
+		{handler, HandlerPid, terminated} ->
+			NewHandlerPids = sets:del_element(HandlerPid, HandlerPids),
+			NewState = State#conn_mgr_state{
+				handler_pids = NewHandlerPids
+				},
+			connection_manage_loop(NewState);
+		{handler, HandlerPid, conn_error} ->
+			NewHandlerPids = sets:del_element(HandlerPid, HandlerPids),
+			NewState = State#conn_mgr_state{
+				handler_pids = NewHandlerPids
+				},
+			connection_manage_loop(NewState);
+		{parent, PPid, terminate} ->
+			erlang:exit(LPid, kill),
+			sets:fold(
+				fun(HandlerPid, AccIn) ->
+					MRef = erlang:monitor(process, HandlerPid),
+					HandlerPid ! {parent, self(), terminate},
+					receive
+						{'DOWN', MRef, process, HandlerPid, _Info} ->
+							ok
+					end,
+					AccIn
+				end, none, HandlerPids),
+			print_info("Connection Manager process (~w) is terminated successfully~n", [self()]);
+		Else ->
+			print_info("Connection Manager process (~w) received unknown message: ~w, discarded~n", [self(), Else]),
+			connection_manage_loop(State)
+	end.
+
+strip(Text) ->
+	HeadStrippedText = strip_head(Text),
+	strip_tail(HeadStrippedText).
+
+strip_tail(Text) ->
+	ReversedStrippedText = strip_head(lists:reverse(Text)),
+	lists:reverse(ReversedStrippedText).
+
+strip_head([$\n | RestText]) ->
+	strip_head(RestText);
+
+strip_head([$\t | RestText]) ->
+	strip_head(RestText);
+
+strip_head([$\s | RestText]) ->
+	strip_head(RestText);
+
+strip_head(Text) ->
+	Text.
+
+process_user_input() ->
+	case io:get_line("") of
+		RawCmdLine when is_list(RawCmdLine) ->
+			CmdLine = strip(RawCmdLine),
+			case CmdLine of
+				"exit" ->
+					print_info("User requested to terminate program execution~n", []);
+				"" ->
+					process_user_input();
+				_Else ->
+					print_error("Unrecoganized command~n", []),
+					process_user_input()
+			end;
+		eof ->
+			process_user_input();
+		{error, _Err} ->
+			print_error("I/O Reading error~n", []),
+			process_user_input()
+	end.
+
+run(ExecArgs) ->
+	case gen_tcp:listen(0, [list, {active, false}, {ifaddr, {local, ExecArgs#exec_args.listen_sock_path}}]) of
+		{ok, LSock} ->
+			MyPid = self(),
+			ConnMgrPid = erlang:spawn(fun() -> connection_manage_init(MyPid, LSock) end),
+			process_user_input(),
+			MRef = erlang:monitor(process, ConnMgrPid),
+			ConnMgrPid ! {parent, self(), terminate},
+			receive
+				{'DOWN', MRef, process, ConnMgrPid, _Info} ->
+					ok
+			end,
+			gen_tcp:close(LSock),
+			file:delete(ExecArgs#exec_args.listen_sock_path);
+		{error, _Reason} ->
+			print_error("cannot create socket file: ~s~n", [ExecArgs#exec_args.listen_sock_path]),
+			erlang:halt(1)
+	end.
+
+main(Args) ->
+	case catch parse_arguments(Args, #exec_args{}) of
+		#exec_args{} = ExecArgs ->
+			run(ExecArgs);
+		_Else ->
+			print_error("bad arguments.~n", []),
+			erlang:halt(1)
+	end.
