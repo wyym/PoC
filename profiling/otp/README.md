@@ -1,4 +1,4 @@
-Erlang/OTP Profiling Framework & Application
+# Erlang/OTP Profiling Framework & Application
 
 This subfolder includes the framework for CPU/memory usage profiling. It is
 developed with Erlang programming language and support to profile any object
